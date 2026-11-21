@@ -1,5 +1,9 @@
 # PHS Downloader
 
+> [!NOTE]
+> **Proyek ini telah pindah & di-rebrand menjadi `px-media` di monorepo [pratamax00/px-bots](https://github.com/pratamax00/px-bots).**
+> Pengembangan selanjutnya, rilis binary, dan changelog aktif ada di monorepo `px-bots`. Repositori ini dipertahankan sebagai arsip riwayat awal.
+
 Bot Telegram ringan (owner-only) berbasis Rust static binary untuk mengunduh file Google Drive (`gdrive-dl`) dan Pixeldrain ke library media Jellyfin, dengan UI Bot API 10.3+ (rich message, in-place edit, tabel GFM, `<details>`, dan native `<tg-button>`).
 
 ## Fitur
