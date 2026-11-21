@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
 use std::io::Read;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -154,12 +154,29 @@ fn details_block(summary: &str, content: &str) -> String {
     format!("<details>\n<summary>{summary}</summary>\n\n{content}\n\n</details>")
 }
 
+fn esc_attr(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 fn tg_url_button(label: &str, url: &str) -> String {
-    format!("<tg-button type=\"url\" url=\"{url}\">{label}</tg-button>")
+    format!("<tg-button type=\"url\" url=\"{}\">{label}</tg-button>", esc_attr(url))
 }
 
 fn tg_cb_button(label: &str, data: &str) -> String {
-    format!("<tg-button type=\"callback_data\" data=\"{data}\">{label}</tg-button>")
+    format!(
+        "<tg-button type=\"callback_data\" data=\"{}\">{label}</tg-button>",
+        esc_attr(data)
+    )
+}
+
+fn tg_copy_button(label: &str, text: &str) -> String {
+    format!(
+        "<tg-button type=\"copy_text\" text=\"{}\">{label}</tg-button>",
+        esc_attr(text)
+    )
 }
 
 fn tg_button_row(buttons: &[String]) -> String {
@@ -216,7 +233,6 @@ fn format_epoch_wib(wib_secs: i64) -> String {
     let hour = tod / 3600;
     let min = (tod % 3600) / 60;
 
-    // Civil date dari Howard Hinnant algorithm
     let z = days + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
     let doe = (z - era * 146097) as u64;
@@ -254,18 +270,24 @@ fn progress_bar(ratio: f64, width: usize) -> String {
 }
 
 fn format_progress_line(bytes: u64, total: Option<u64>, elapsed_secs: u64) -> String {
-    let speed = if elapsed_secs > 0 {
-        bytes as f64 / elapsed_secs as f64 / 1024.0 / 1024.0
+    let speed_bps = if elapsed_secs > 0 {
+        bytes as f64 / elapsed_secs as f64
     } else {
         0.0
     };
+    let speed_mb = speed_bps / 1024.0 / 1024.0;
     let dur = format_duration(elapsed_secs);
     match total {
         Some(tot) if tot > 0 => {
             let pct = ((bytes as f64 / tot as f64) * 100.0).clamp(0.0, 100.0);
             let bar = progress_bar(bytes as f64 / tot as f64, 10);
+            let eta = if speed_bps > 1.0 && tot > bytes {
+                format!("ETA {}", format_duration(((tot - bytes) as f64 / speed_bps) as u64))
+            } else {
+                dur
+            };
             format!(
-                "📥 {bar} {} · {} · `{speed:.1} MB/s` · `{dur}`",
+                "📥 {bar} {} · {} · `{speed_mb:.1} MB/s` · `{eta}`",
                 hl(&format!("{pct:.0}%")),
                 hl(&format!("{} / {}", human(bytes), human(tot)))
             )
@@ -274,13 +296,13 @@ fn format_progress_line(bytes: u64, total: Option<u64>, elapsed_secs: u64) -> St
             format!(
                 "📥 {} · {} · `{dur}`",
                 hl(&human(bytes)),
-                hl(&format!("{speed:.1} MB/s"))
+                hl(&format!("{speed_mb:.1} MB/s"))
             )
         }
     }
 }
 
-fn disk_usage_line(path: &str) -> String {
+fn disk_usage_visual(path: &str) -> String {
     let out = Command::new("df")
         .args(["-h", "--output=used,size,pcent", path])
         .output();
@@ -290,12 +312,65 @@ fn disk_usage_line(path: &str) -> String {
             if let Some(line) = text.lines().nth(1) {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() >= 3 {
-                    return format!("{} / {} ({})", parts[0], parts[1], parts[2]);
+                    let pct_num = parts[2]
+                        .trim_end_matches('%')
+                        .parse::<f64>()
+                        .unwrap_or(0.0);
+                    let bar = progress_bar(pct_num / 100.0, 8);
+                    return format!("{bar} {} · {}/{}", hl(parts[2]), parts[0], parts[1]);
                 }
             }
         }
     }
     "—".to_string()
+}
+
+/// Cek cepat apakah port Jellyfin sedang hidup (timeout 150 ms).
+fn jellyfin_online(url: &str) -> bool {
+    let stripped = url
+        .trim()
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
+    let host_port = stripped.split('/').next().unwrap_or("");
+    let addr_str = if host_port.contains(':') {
+        host_port.to_string()
+    } else if url.starts_with("https://") {
+        format!("{host_port}:443")
+    } else {
+        format!("{host_port}:80")
+    };
+    if let Ok(mut addrs) = addr_str.to_socket_addrs() {
+        if let Some(addr) = addrs.next() {
+            return TcpStream::connect_timeout(&addr, Duration::from_millis(150)).is_ok();
+        }
+    }
+    false
+}
+
+/// Ambil 5 file terbaru di folder tertentu.
+fn list_recent_files(dir: &Path, limit: usize) -> Vec<(String, u64, i64)> {
+    let mut items = Vec::new();
+    if let Ok(rd) = fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue;
+            }
+            if let Ok(meta) = entry.metadata() {
+                let size = if meta.is_file() { meta.len() } else { 0 };
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                items.push((name, size, mtime));
+            }
+        }
+    }
+    items.sort_by(|a, b| b.2.cmp(&a.2));
+    items.truncate(limit);
+    items
 }
 
 // ── state ───────────────────────────────────────────────────────────────────
@@ -398,7 +473,6 @@ impl App {
         Ok(parsed)
     }
 
-    /// Kirim pesan baru rich-first, fallback HTML. Mengembalikan `message_id`.
     fn send(&self, markdown: &str, keyboard: Option<Value>) -> Option<i64> {
         let mut payload = json!({
             "chat_id": self.cfg.owner_id,
@@ -433,7 +507,6 @@ impl App {
         }
     }
 
-    /// Edit pesan lama secara in-place (Bot API 10.3 `editMessageText` + `rich_message`).
     fn edit(&self, message_id: i64, markdown: &str, keyboard: Option<Value>) -> Option<i64> {
         let mut payload = json!({
             "chat_id": self.cfg.owner_id,
@@ -483,7 +556,6 @@ impl App {
         }
     }
 
-    /// Non-blocking callback ack agar respons tombol 1x RTT.
     fn ack(self: &Arc<Self>, cb_id: String, text: &str) {
         let app = Arc::clone(self);
         let msg = text.to_string();
@@ -517,22 +589,20 @@ impl App {
                 ],
                 [
                     button(target_label("anime"), "pick:anime", style_for("anime")),
-                    button("🔗 Link Akses", "act:links", "primary"),
+                    button("🕒 Terbaru", "act:recent", "primary"),
                 ],
                 [
                     button("📡 Scan Jellyfin", "act:scan", "primary"),
-                    button("🔄 Segarkan", "act:menu", ""),
+                    button("🔗 Link Akses", "act:links", "primary"),
                 ],
             ]
         })
     }
 
-    /// Dashboard utama bergaya violet-breakglass.
     fn menu_text(&self) -> String {
         let active_folder = { self.state.lock().unwrap().folder.clone() };
-        let busy_folders: Vec<String> = {
-            self.busy.lock().unwrap().iter().cloned().collect()
-        };
+        let busy_count = { self.busy.lock().unwrap().len() };
+        let jf_up = jellyfin_online(&self.cfg.jellyfin_url);
 
         let mut counts = [0usize; 3];
         let mut detail_rows = Vec::new();
@@ -544,16 +614,16 @@ impl App {
                 counts[idx] = c;
                 detail_rows.push(vec![
                     target_label(k).to_string(),
-                    format!("`{p}`"),
                     format!("{c} item"),
+                    format!("`{p}`"),
                 ]);
             }
         }
 
-        let status_val = if busy_folders.is_empty() {
-            hl("✅ Siap")
+        let status_val = if busy_count == 0 {
+            hl("🟢 Siap")
         } else {
-            hl(&format!("⬇️ Mengunduh ({})", busy_folders.len()))
+            hl(&format!("⬇️ Mengunduh ({busy_count})"))
         };
         let target_val = active_folder
             .as_deref()
@@ -563,7 +633,12 @@ impl App {
             "{} Film · {} Series · {} Anime",
             counts[0], counts[1], counts[2]
         ));
-        let disk_val = hl(&disk_usage_line(&self.cfg.dir_films));
+        let disk_val = disk_usage_visual(&self.cfg.dir_films);
+        let jf_val = if jf_up {
+            hl("🟢 Online")
+        } else {
+            "⏸️ Off (hemat RAM)".to_string()
+        };
 
         let metrics = table_markdown(
             &["Field", "Value"],
@@ -571,14 +646,18 @@ impl App {
                 vec!["Status".into(), status_val],
                 vec!["Tujuan".into(), target_val],
                 vec!["Library".into(), library_val],
-                vec!["Disk Media".into(), disk_val],
+                vec!["Storage".into(), disk_val],
+                vec!["Jellyfin".into(), jf_val],
             ],
         );
 
         let mut pills = vec![
             tg_cb_button("🔄 Segarkan", "act:menu"),
-            tg_cb_button("📡 Scan", "act:scan"),
+            tg_cb_button("🕒 Terbaru", "act:recent"),
         ];
+        if jf_up {
+            pills.push(tg_cb_button("📡 Scan", "act:scan"));
+        }
         if !self.cfg.link_filebrowser.is_empty() {
             pills.push(tg_url_button("📂 Files", &self.cfg.link_filebrowser));
         }
@@ -588,12 +667,12 @@ impl App {
                 "Kirim link **Google Drive** atau **Pixeldrain** untuk unduh ke **{}**.",
                 target_label(k)
             ),
-            None => "Pilih folder tujuan di tombol bawah, lalu kirim link unduhan.".to_string(),
+            None => "Pilih folder tujuan di bawah, lalu kirim link unduhan.".to_string(),
         };
 
         let detail_body = format!(
-            "{}\n\n- Klik tombol folder (hijau = aktif) untuk ganti tujuan langsung.\n- Mendukung Google Drive (`/file/d/...`) dan Pixeldrain (`/u/...`).",
-            table_markdown(&["Folder", "Path", "Isi"], &detail_rows)
+            "{}\n\n- Tombol folder **hijau** menandakan tujuan aktif.\n- Progres unduhan diperbarui 1 baris di pesan yang sama.",
+            table_markdown(&["Folder", "Isi", "Path"], &detail_rows)
         );
 
         [
@@ -609,6 +688,58 @@ impl App {
             "---".to_string(),
             String::new(),
             details_block("Folder Library & Panduan", &detail_body),
+        ]
+        .join("\n")
+    }
+
+    fn recent_text(&self) -> String {
+        let folder = {
+            self.state
+                .lock()
+                .unwrap()
+                .folder
+                .clone()
+                .unwrap_or_else(|| "anime".to_string())
+        };
+        let path_str = self
+            .cfg
+            .target_path(&folder)
+            .unwrap_or(self.cfg.dir_anime.as_str());
+        let recent = list_recent_files(Path::new(path_str), 6);
+
+        let body = if recent.is_empty() {
+            "_Folder masih kosong._".to_string()
+        } else {
+            let rows_data: Vec<Vec<String>> = recent
+                .iter()
+                .map(|(name, size, _)| {
+                    vec![
+                        format!("`{}`", truncate_str(name, 30)),
+                        if *size > 0 { hl(&human(*size)) } else { "📁 dir".into() },
+                    ]
+                })
+                .collect();
+            table_markdown(&["Item Terbaru", "Ukuran"], &rows_data)
+        };
+
+        let pills = tg_button_row(&[
+            tg_copy_button("📋 Salin Path", path_str),
+            tg_cb_button("🔄 Segarkan", "act:recent"),
+            tg_cb_button("📁 Menu", "act:menu"),
+        ]);
+
+        [
+            format!("**🕒 Terbaru** · {}", hl(target_label(&folder))),
+            String::new(),
+            body,
+            String::new(),
+            format!("_{}_", stamp_wib()),
+            String::new(),
+            pills,
+            String::new(),
+            "---".to_string(),
+            String::new(),
+            details_block("Path Folder", &format!("`{path_str}`")),
         ]
         .join("\n")
     }
@@ -633,12 +764,14 @@ impl App {
         }
         if !self.cfg.link_jellyfin_ts.is_empty() {
             service_rows.push(vec![
-                "Jellyfin Tailscale".to_string(),
+                "Jellyfin TS".to_string(),
                 self.cfg.link_jellyfin_ts.clone(),
             ]);
             pills.push(tg_url_button("🌐 Jellyfin TS", &self.cfg.link_jellyfin_ts));
         }
-        pills.push(tg_cb_button("📁 Menu", "act:menu"));
+        if !self.cfg.server_ip.is_empty() {
+            pills.push(tg_copy_button("📋 Salin IP", &self.cfg.server_ip));
+        }
 
         let mut path_rows = Vec::new();
         for k in TARGET_KEYS {
@@ -649,8 +782,8 @@ impl App {
         let mut notes = vec![
             table_markdown(&["Folder", "Path"], &path_rows),
             String::new(),
-            "- Filebrowser bisa diakses dari luar lewat tunnel.".to_string(),
-            "- Jellyfin **LAN** untuk jaringan lokal; **Tailscale** untuk akses remote.".to_string(),
+            "- Filebrowser bisa dibuka dari mana saja via tunnel.".to_string(),
+            "- Jellyfin **LAN** untuk jaringan lokal; **Tailscale** untuk akses luar.".to_string(),
         ];
         if !self.cfg.server_ip.is_empty() {
             notes.push(format!("- Server LAN: `{}`", self.cfg.server_ip));
@@ -662,20 +795,22 @@ impl App {
             table_markdown(&["Layanan", "URL"], &service_rows)
         };
 
-        [
+        let mut blocks = vec![
             format!("**🔗 Link Akses** · {}", hl("Layanan Media")),
             String::new(),
             main_table,
             String::new(),
             format!("_{}_", stamp_wib()),
-            String::new(),
-            tg_button_row(&pills),
-            String::new(),
-            "---".to_string(),
-            String::new(),
-            details_block("Folder & Catatan", &notes.join("\n")),
-        ]
-        .join("\n")
+        ];
+        if !pills.is_empty() {
+            blocks.push(String::new());
+            blocks.push(tg_button_row(&pills));
+        }
+        blocks.push(String::new());
+        blocks.push("---".to_string());
+        blocks.push(String::new());
+        blocks.push(details_block("Folder & Catatan", &notes.join("\n")));
+        blocks.join("\n")
     }
 
     fn jellyfin_scan(&self) -> String {
@@ -686,6 +821,25 @@ impl App {
                 stamp_wib()
             );
         }
+        if !jellyfin_online(&self.cfg.jellyfin_url) {
+            let tbl = table_markdown(
+                &["Field", "Value"],
+                &[
+                    vec!["Status".into(), hl("⏸️ Jellyfin Off")],
+                    vec!["Endpoint".into(), format!("`{}`", self.cfg.jellyfin_url)],
+                ],
+            );
+            return [
+                "**📡 Scan Jellyfin**".to_string(),
+                String::new(),
+                tbl,
+                String::new(),
+                "Jellyfin sedang dimatikan (hemat RAM). Nyalakan dulu lewat **VBreak → Apps** saat mau nonton atau scan library.".to_string(),
+                format!("_{}_", stamp_wib()),
+            ]
+            .join("\n");
+        }
+
         let url = format!("{}/Library/Refresh", self.cfg.jellyfin_url.trim_end_matches('/'));
         let auth = format!("MediaBrowser Token=\"{}\"", self.cfg.jellyfin_token);
         let t0 = Instant::now();
@@ -698,12 +852,12 @@ impl App {
                         &["Field", "Value"],
                         &[
                             vec!["Status".into(), hl("✅ Dipicu")],
-                            vec!["HTTP".into(), hl(&format!("{status} · {ms} ms"))],
+                            vec!["Respon".into(), hl(&format!("HTTP {status} · {ms} ms"))],
                             vec!["Endpoint".into(), format!("`{}`", self.cfg.jellyfin_url)],
                         ],
                     );
                     format!(
-                        "**📡 Scan Jellyfin**\n\n{tbl}\n\nLibrary refresh berjalan di background. Metadata baru muncul beberapa saat lagi.\n\n_{}_",
+                        "**📡 Scan Jellyfin**\n\n{tbl}\n\nLibrary refresh berjalan di background. Metadata & poster baru muncul beberapa saat lagi.\n\n_{}_",
                         stamp_wib()
                     )
                 } else {
@@ -749,7 +903,13 @@ fn log_error(msg: &str) {
 }
 
 fn truncate_str(s: &str, max_chars: usize) -> String {
-    s.chars().take(max_chars).collect()
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max_chars {
+        s.to_string()
+    } else {
+        let cut: String = chars[..max_chars.saturating_sub(1)].iter().collect();
+        format!("{cut}…")
+    }
 }
 
 fn tail_str(s: &str, max_chars: usize) -> String {
@@ -845,10 +1005,22 @@ fn kb_after() -> Value {
         "inline_keyboard": [
             [
                 button("📡 Scan Jellyfin", "act:scan", "success"),
-                button("🔗 Link Akses", "act:links", "primary"),
+                button("🕒 Terbaru", "act:recent", "primary"),
             ],
-            [button("📁 Menu Utama", "act:menu", "primary")],
+            [
+                button("🔗 Link Akses", "act:links", "primary"),
+                button("📁 Menu Utama", "act:menu", "primary"),
+            ],
         ]
+    })
+}
+
+fn kb_recent() -> Value {
+    json!({
+        "inline_keyboard": [[
+            button("📁 Menu Utama", "act:menu", "primary"),
+            button("🔄 Segarkan", "act:recent", ""),
+        ]]
     })
 }
 
@@ -886,7 +1058,7 @@ fn build_progress_card(
     let tbl = table_markdown(
         &["Field", "Value"],
         &[
-            vec!["File".into(), format!("`{}`", truncate_str(file_name, 42))],
+            vec!["File".into(), format!("`{}`", truncate_str(file_name, 40))],
             vec!["Folder".into(), target_label(folder).into()],
             vec!["Sumber".into(), source.into()],
         ],
@@ -926,7 +1098,7 @@ fn build_done_card(
         &["Field", "Value"],
         &[
             vec!["Status".into(), hl("✅ Selesai")],
-            vec!["File".into(), format!("`{}`", truncate_str(fname, 44))],
+            vec!["File".into(), format!("`{}`", truncate_str(fname, 42))],
             vec!["Ukuran".into(), hl(&human(size))],
             vec![
                 "Kecepatan".into(),
@@ -937,12 +1109,14 @@ fn build_done_card(
         ],
     );
 
+    let path_str = full_path.to_string_lossy();
     let pills = tg_button_row(&[
-        tg_cb_button("📡 Scan Jellyfin", "act:scan"),
+        tg_cb_button("📡 Scan", "act:scan"),
+        tg_copy_button("📋 Salin Path", &path_str),
         tg_cb_button("📁 Menu", "act:menu"),
     ]);
 
-    let mut notes = vec![format!("Path: `{}`", full_path.display())];
+    let mut notes = vec![format!("Path: `{path_str}`")];
     notes.extend(extra_notes.iter().cloned());
 
     [
@@ -1123,10 +1297,9 @@ fn run_download(app: Arc<App>, folder: String, url: String, status_msg_id: Optio
     let before = snapshot_dir(&dest);
     let before_watch = before.clone();
 
-    // Watcher 1-line in-place replace tiap 10 detik bila ukuran bertambah
     let watcher = thread::spawn(move || {
         let mut last_bytes: u64 = 0;
-        while !sleep_interruptible(&stop_watch, Duration::from_secs(10)) {
+        while !sleep_interruptible(&stop_watch, Duration::from_secs(8)) {
             let current = snapshot_dir(&dest_watch);
             let mut active: Option<(String, u64)> = None;
             for (name, (sz, mtime)) in &current {
@@ -1283,10 +1456,9 @@ fn run_pixeldrain(app: Arc<App>, folder: String, fid: String, status_msg_id: Opt
     let label_watch = name.clone();
     let folder_watch = folder.clone();
 
-    // Watcher 1-line in-place replace tiap 8 detik bila ukuran bertambah
     let watcher = thread::spawn(move || {
         let mut last_bytes: u64 = 0;
-        while !sleep_interruptible(&stop_watch, Duration::from_secs(8)) {
+        while !sleep_interruptible(&stop_watch, Duration::from_secs(6)) {
             if let Ok(meta) = fs::metadata(&target_watch) {
                 let bytes = meta.len();
                 if bytes > last_bytes {
@@ -1416,7 +1588,6 @@ fn handle_callback(app: &Arc<App>, cb: &Value) {
             app.persist_state(&st);
         }
         app.ack(cb_id, &format!("Tujuan: {}", target_label(folder)));
-        // Langsung edit Dashboard Menu di tempat (tombol aktif jadi hijau seperti vbreak)
         app.present(msg_id, &app.menu_text(), Some(app.kb_menu()));
     } else if data.starts_with("go:") {
         if data == "go:no" {
@@ -1468,11 +1639,14 @@ fn handle_callback(app: &Arc<App>, cb: &Value) {
             let url = p.url.unwrap_or_default();
             thread::spawn(move || run_download(app_clone, p.folder, url, msg_id));
         }
+    } else if data == "act:recent" {
+        app.ack(cb_id, "File terbaru");
+        app.present(msg_id, &app.recent_text(), Some(kb_recent()));
     } else if data == "act:links" {
         app.ack(cb_id, "Link akses");
         app.present(msg_id, &app.links_text(), Some(kb_links()));
     } else if data == "act:scan" {
-        app.ack(cb_id, "Memindai…");
+        app.ack(cb_id, "Cek Jellyfin…");
         app.present(msg_id, &app.jellyfin_scan(), Some(kb_after()));
     } else {
         app.ack(cb_id, "Disegarkan");
@@ -1507,6 +1681,9 @@ fn handle_message(app: &Arc<App>, msg: &Value) {
             }
             "/links" => {
                 app.send(&app.links_text(), Some(kb_links()));
+            }
+            "/recent" => {
+                app.send(&app.recent_text(), Some(kb_recent()));
             }
             _ => {
                 app.send(&app.menu_text(), Some(app.kb_menu()));
@@ -1581,7 +1758,7 @@ fn handle_message(app: &Arc<App>, msg: &Value) {
                 &["Field", "Value"],
                 &[
                     vec!["Tujuan".into(), hl(target_label(&folder))],
-                    vec!["File".into(), format!("`{}`", truncate_str(preview_name, 42))],
+                    vec!["File".into(), format!("`{}`", truncate_str(preview_name, 40))],
                     vec!["Ukuran".into(), hl(&preview_size)],
                     vec!["File ID".into(), format!("`{pid}`")],
                 ],
@@ -1611,7 +1788,7 @@ fn handle_message(app: &Arc<App>, msg: &Value) {
             &[
                 vec!["Tujuan".into(), hl(target_label(&folder))],
                 vec!["Sumber".into(), "Google Drive (`gdrive-dl`)".into()],
-                vec!["File ID".into(), format!("`{}…`", truncate_str(&fid, 14))],
+                vec!["File ID".into(), format!("`{}`", truncate_str(&fid, 16))],
             ],
         ),
         stamp_wib()
@@ -1664,6 +1841,7 @@ fn main() {
         json!({
             "commands": [
                 {"command": "menu", "description": "Dashboard & pilih folder"},
+                {"command": "recent", "description": "File terbaru di folder aktif"},
                 {"command": "links", "description": "Link akses layanan media"},
                 {"command": "scan", "description": "Scan library Jellyfin"},
                 {"command": "help", "description": "Bantuan"},
@@ -1752,11 +1930,11 @@ mod tests {
     }
 
     #[test]
-    fn test_progress_line() {
+    fn test_progress_line_with_eta() {
         let with_total = format_progress_line(50 * 1024 * 1024, Some(100 * 1024 * 1024), 10);
         assert!(with_total.contains("▓▓▓▓▓░░░░░"));
         assert!(with_total.contains("==50%=="));
-        assert!(with_total.contains("5.0 MB/s"));
+        assert!(with_total.contains("ETA 00:10"));
 
         let no_total = format_progress_line(100 * 1024 * 1024, None, 10);
         assert!(no_total.contains("==100.0 MB=="));
@@ -1764,12 +1942,12 @@ mod tests {
     }
 
     #[test]
-    fn test_format_epoch_wib() {
-        // 2026-11-21 08:30:00 WIB -> UTC 2026-11-21 01:30:00
-        let wib = 1795224600; // 2026-11-21T01:30:00Z + 7h
-        let s = format_epoch_wib(wib);
-        assert!(s.ends_with("WIB"));
-        assert!(s.contains("2026"));
+    fn test_copy_button() {
+        let b = tg_copy_button("📋 Salin", "/mnt/storage/media/anime");
+        assert_eq!(
+            b,
+            "<tg-button type=\"copy_text\" text=\"/mnt/storage/media/anime\">📋 Salin</tg-button>"
+        );
     }
 
     #[test]
