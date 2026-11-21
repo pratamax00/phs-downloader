@@ -1,0 +1,61 @@
+name: Build Rust Static Binary
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run unit tests
+        run: cargo test --verbose
+
+      - name: Build static release binary (musl)
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Inspect binary
+        run: |
+          ls -lh target/x86_64-unknown-linux-musl/release/phs-downloader
+          file target/x86_64-unknown-linux-musl/release/phs-downloader
+          ./target/x86_64-unknown-linux-musl/release/phs-downloader --version
+
+      - name: Publish rolling release (latest)
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [ "$TAG" = "main" ]; then
+            TAG="latest"
+          fi
+          cp target/x86_64-unknown-linux-musl/release/phs-downloader phs-downloader-linux-x86_64
+          sha256sum phs-downloader-linux-x86_64 > phs-downloader-linux-x86_64.sha256
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" phs-downloader-linux-x86_64 phs-downloader-linux-x86_64.sha256 --clobber
+          else
+            gh release create "$TAG" phs-downloader-linux-x86_64 phs-downloader-linux-x86_64.sha256 \
+              --title "PHS Downloader ($TAG)" \
+              --notes "Build otomatis dari commit ${GITHUB_SHA::7} (x86_64-unknown-linux-musl)."
+          fi

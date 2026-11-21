@@ -1,0 +1,18 @@
+[package]
+name = "phs-downloader"
+version = "0.2.0"
+edition = "2021"
+description = "Bot Telegram ringan untuk mengunduh file Google Drive & Pixeldrain ke library media Jellyfin"
+
+[dependencies]
+regex = "1.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+ureq = { version = "2.10", default-features = false, features = ["tls", "json"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
